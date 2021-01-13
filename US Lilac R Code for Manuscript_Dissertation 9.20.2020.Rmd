@@ -1,0 +1,655 @@
+---
+title: "US Lilac R Code"
+author: "Stephanie Nummer"
+date: "November 27, 2018"
+output: html_document
+---
+
+##Setting up front matter
+
+  The front matter, aka loading the packages and setting the base directory, is important to ensure the ease of coding for the writer and other code readers. If someone wishes to run this code, the majority of changes in file directory will be made by changing it in the front matter. Additionally, in this chunk I am going to import the base dataset that will be used for all future coding and data managememt. 
+
+```{r setup, include=FALSE}
+packages<-function(x, repos="http://cran.r-project.org", ...){
+  x<-as.character(match.call()[[2]])
+  if (!require(x,character.only=TRUE)){
+    install.packages(pkgs=x, repos=repos, ...)
+    require(x,character.only=TRUE)
+  }
+}
+
+#Setting base directory and data directory
+base <- "C:/Users/steph/Documents/UToledo_PHD/PhD Research/HockeyStick Model"
+dataDIR <- paste(base, "Data/Lilac", sep="/")
+plotDIR <- paste(base, "manuscript", sep="/")
+setwd(base)
+
+#Loading Packages
+packages(arm)
+packages(grDevices)
+packages(lattice)
+packages(rv)
+packages(rstan)
+packages(tidyverse)
+packages(dplyr)
+packages(ggplot2)
+packages(reshape2)
+packages(tidyverse)
+packages(cowplot)
+packages(GGally)
+packages(mapproj)
+packages(maps)
+packages(rgdal)
+packages(rgeos)
+packages(rstan)
+packages(rstudioapi)
+packages(maptools)
+packages(RColorBrewer)
+packages(ggmap)
+packages(sp)
+packages(gridExtra)
+
+#importing data
+USLilac <- read.csv(paste(dataDIR, "NAmlilac.csv", sep="/"), header=T)
+```
+
+##Cleaning Up Data & Formatting
+
+  In the following chunck I will be performing data management to parse out the data needed to run the Bayesian hierarchcial hockey-stick model. The beginning of this cunck incorporated the clone type names associated with the phenotypes listed and changes the creators use of 999 as a missing value to NA. This is followed by importing the station specific information and performing the data management to match the site information with the phenological observation. This was done by first determining which stations had at least 30 years of data and then matching it with the latitude, longitude, evelvation, station name and state each station is located in. This matched data was then exported for later use in ArcGIS for matching based on geographic location. The final portion of this section is to add the station information to the dataset that has at least 30 years of information per station for use in the Bayesian hierarchcical hockey-stick model, summarizing the number of stations per phenotype in the resulting dataset, and testing a line of code that is later incorporated into the Stan model. 
+
+```{r, message=FALSE}
+#Adding Type column based on lilac species
+USLilac$type <- "Syringa chinensis clone"
+USLilac$type[USLilac$Ptype==2] <-"Syringa vulgaris"
+
+#Changing 999 (their code for NA) to NAs
+USLilac$FirstLeaf[USLilac$FirstLeaf==999] <- NA
+USLilac$FirstBloom[USLilac$FirstBloom==999] <- NA
+
+#Importing Station Data
+USLilacST <- read.csv(paste(dataDIR, "NAmlilacsST.csv", sep="/"), header=T)
+
+##Keeping data with at least 30 years worth of records
+keep <- !is.na(match(USLilac$STID,
+                     as.numeric(names(table(USLilac$STID))[table(USLilac$STID)>=30])))
+uslilacs <- USLilac[keep,]
+stlist <- unique(uslilacs$STID)
+keep <- !is.na(match(USLilacST$ID, stlist))
+sttype1 <- unique(USLilac$STID[USLilac$Ptype==1])
+sttype2 <- unique(USLilac$STID[USLilac$Ptype==2])
+uslilacsST <- USLilacST[keep,]
+
+#Adding informtion about each station to the list of station we are keeping
+US_Lilacs_StationInfo<-data.frame("Station ID"=uslilacsST$ID, "Latitude"=uslilacsST$Lat, "Longitude"=uslilacsST$X.Long, "Elevation"=uslilacsST$X.Elev, "Station Name"=uslilacsST$Station, "State"=uslilacsST$State)
+
+#Writing information into a csv for later access and use in ArcGIS
+write.csv(US_Lilacs_StationInfo, file="C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\Papers\\Publication Manuscripts\\Lilac Manuscript - Global Change Biology\\US Lilac Station Info.csv")
+
+#Adding latitude and longitude information to dataframe for input to stan model
+sort(uslilacsST$ID)
+sort(unique(uslilacs$STID))
+uslilacsST <- uslilacsST[order(uslilacsST$ID),]
+uslilacs$Lat <- uslilacsST$Lat[as.numeric(ordered(uslilacs$STID))]
+uslilacs$Lon <- uslilacsST$X.Long[as.numeric(ordered(uslilacs$STID))]
+uslilacs$Elev <- uslilacsST$X.Elev[as.numeric(ordered(uslilacs$STID))]
+
+
+## station lat/lon
+sites <- data.frame(stid = levels(ordered(uslilacs$STID)),
+                    lat = uslilacs$Lat[cumsum(table(uslilacs$STID))],
+                    lon = uslilacs$Lon[cumsum(table(uslilacs$STID))],
+                    elv = uslilacs$Elev[cumsum(table(uslilacs$STID))])
+
+
+###Getting Ptype for each Station
+StPtype<-uslilacs %>%
+  group_by(STID) %>%
+  summarise( Ptype=mean(Ptype))
+
+#Testing code to stan model
+GrYrMin<-tapply(uslilacs$Year, uslilacs$STID, min)
+
+```
+
+##US Lilac Map Data
+
+  In this small section, I create a dataset meant to graph the stations by phenotype.
+
+```{r, FALSE}
+
+#Getting information arranged by phenotype to map later
+USLilacMap<-USLilacST
+USLilacMap$Type<-"PType 1"
+temp <- !is.na(match(USLilacST$ID, sttype2))
+USLilacMap$Type[temp]<-"PType 2"
+
+```
+
+##Bayesian Multilevel Model Lilac Model Using Step Function
+
+  Below is the development of the Bayesian hierarchcial hockey-stick model in rstan. The hockey-stick model used below was first created as a function in R, to reduce the amount of time needed when performing this model on multiple datasets and to reduce the chance of user error in typing and copying. In this function the inputs needed are: the dataset, what the response variable is, the year, and the groupings (typically location, but may be another exchangable factor such as species). The first step of the function is to extract the different pieces of data needed and assign them a variable name. Next, the groupings are transitioned from a factor to a numeric variable and then the range of years for each grouping is determed. Essentially, the minumum and maxixmum year of phenological observation is calculated for each group and stored in a separate variable. The next step below is calculating the number of datapoints and the number of groups in the dataset. From there the data to put into the Stan code is compiled into a list. This list of input data includes the number of datapoints, the number of groups, the day of year of the first blooms (aka the response), the first year observed for each group, and the last year observed for each group. Next, the initial values are assigned for all parameters in the stan model. These values are assigned in a for loop to allow for a different random variable to start as the initial value of the model for each chain. Next, the lists creted thus far are compiled in to 1 list with the model code for input into rstan. 
+  
+  The model below follows the functional form of: 
+  
+$$y_{ij}=\{ \begin{array}
+{rcl}
+\alpha_j+\epsilon_{1j}, & & x_i < \phi_j \\
+\alpha_j+\beta_j(x_i-\phi_j)+\epsilon_{2j}, & & x_i \ge \phi_j
+\end{array}
+$$
+  
+where where $y_i$ is the response measured in day of year, the subscript $\j$ represents location, $\alpha$ is the intercept of the left line segment (representing the average response before the effect of climate change on the response can be detected through the model), $\beta$ is the slope of the right line segment (representing the average annual change of the response since the effect of climate change on the response became detectable), $x_i$ is the calendar year, $\phi$ is the changepoint where the two line segments meet (the year when climate change effect on the response become detectable).The changepoint, $\phi$, for each location is limited by the first and last year of monitoring for that group. As such, the changepoint cannot be outside the range of data when monitoring occurred for each location. If the change occurred before the first year or after the last year of the record, the estimated changepoint would be concentrated on one or the other end of the time record. In addition, $\epsilon_1$ and $\epsilon_2$ are the error terms associated with the model (representing the annual variability of the response variable) and assumed to be normal random variables with a constant variance $\epsilon_1 \sim N(0, ??_{1,2})$ and $\epsilon_2 \sim N(0, ??_{2,2})$. This model specification allows the two error terms, $\epsilon_1$ and $\epsilon_2$, to have different variances. 
+
+  To achieve this in rstan, I declared the data, parameters, transform 1 parameter, and model the response (day of year of first bloom) and the hyperparameters. Data in the Stan model include the integers with a lower threshold of 0 for the number of data points, the number of groups, and group ID's; the real value of the response (day of year) and predictor vairables year; and the vector with lengths equal to the number of groups of the first and last year of data collection. The parameters delaired in the model are the real hyperparameters of $\alpha$, $\phi$, and $\beta$, and the variance of the response, group-level $\alpha$, group-level $\phi$, and group-level $\beta$; and the vectors for the group-level $\alpha$, $\beta$, and raw $\phi$. 
+
+  The parameter $\phi$ has varying bounds (the first and last year that observations were made) at the group level. To allow the bounds of $\phi$ to vary at the group level I had to bring in the bounds as 2 different data values -- the first year and the last year -- and estimate the parameter $\phi$ as value between 0 and 1. This value was then transformed in the transformed parameters portion of the Stan code using the first and last year data values to produce the group-level phi estimation that has varying boundaries. This works because the group level parameter was estimated between 0 and 1, aka phiG_raw, and then multiply that by the range of years for the specific group. That value is then added to the starting year (minimum value) to produce the $\phi$ for each individual group (aka station or location). The basis for this transformation was obtained form Stan User Guide. URL: https://mc-stan.org/docs/2_18/stan-users-guide/vectors-with-varying-bounds.html. 
+
+  This gives us the changepoint or $\phi$ for each group or location, but we don't have the hyperparameter yet. The hyperparameter shows up when modeling the distirbution of the group level parameters. The group level distribution for $\phi$ was also estimated with a normal distribution with a mean being the hyperparameter $\phi$ and a variance with a positive value. Now, this presents an issue becuase the same parameter, phiG, was declared or modeled twice. This causes a non-fatal warning that for this to not cause an issue in the model, the log-Jacobian must be added to the liklihood function when modeling phiG with a normal distribution and determining the hyperparameter. The transformation of phiG_raw to phiG is a linear transformation. Becuase of this, the derivative of the transformation is a constant. The constant is -(maximumYear-minimumYear), which will not change the liklihood function of phiG. This means that although phiG is declaired twice, the transformation and likihood function, the hyperparameter still acts as a shrinkage estimator and is a meaningful estimation of the overall average. 
+  
+  In the model declaration of the Stan code I include the mean for each data point; the normal distributions of the group-level $\alpha$, $\beta$, and the transformed $\phi$; the model to calculate the mean for each data point; and the normal distirbution of the response with mean which was calculated in the model portion of the code and the variance which was delared in the parameters. The last portion of the model code not described is the calculation of the mean for each datapoint. This was calculated as the group-level $\alpha$ minus the group-level $\beta$, multiplied by the year minus the changepoint ($\phi$) if the year is greater than the changepoint ($\phi$). This if statement is included through the code int_step(). In this variation of the model the first portion is $\alpha$ - $\beta$, that negative $\beta$ indicates a downward slope and thus resulting postive values of $\beta$ means a negative slope, or an earlier response in the year, and negative values of $\beta$ mean a positive slope, or getting later in the year.
+  
+  The final portion of this chunk brings together the inputs needed for the MCMC sampling in stan, compiles the model code, samples and runs the model for 4 chains of 100,000 iterations, and saves the results as Rdata. 
+  
+```{r, message=FALSE}
+
+packages(rstan)
+
+hockey.step <- function(infile, variable, Year, Group, n.chains=4){
+  y <- infile[,variable]
+  temp <- !is.na(y)
+  infile <- infile[temp,]
+  y <- y[temp]
+  x <- infile[,Year]
+  
+
+  Groupo<-infile[,Group]
+  groupO <- ordered(Groupo)
+  group <- as.numeric(groupO)
+  
+  ##Getting Min Year for Each Station
+  GrYrMin<-tapply(infile[,Year], infile[,Group], min)
+  GrYrMax<-tapply(infile[,Year], infile[,Group], max)
+  
+
+  n <- length(y)
+  n.gr <- max(group)
+  L <- GrYrMin
+  U <- GrYrMax
+  inits <- list()
+  bugs.dat <- list(n=n, ngr=n.gr, y=y, x=x, group=group, minYr=L, maxYr=U)
+  for (i in 1:n.chains)
+    inits[[i]] <- list(alpha=rnorm(1), beta=runif(1), phi=runif(1), alphaG=rep(0, n.gr),
+                       betaG=rep(0, n.gr), phiG=rep(0, n.gr),
+                       sigmay=runif(1, 0, 3), sigmaA=runif(1), sigmaB=runif(1),sigmaP=runif(1))
+  parameters <- c("alpha","beta", "phi", "alphaG", "betaG", "phiG", "sigmay", "sigmaA", "sigmaB", "sigmaP")
+  return(list(para=parameters, data=bugs.dat, inits=inits,
+              n.chains=n.chains, groupID=levels(groupO),
+              model="
+ /*  multilevel hockey stick model with group predictors */
+data{
+  int<lower=0> n;
+  int<lower=0> ngr;
+  real y[n];
+  int<lower=0> group[n]; // grouping IDs
+  real x[n]; // year
+  vector[ngr] minYr; //lower bounds
+  vector[ngr] maxYr; //upper bounds
+}
+
+parameters{
+  real alpha; // intercept at change point
+  real beta; // slope after change point
+  real phi; // change point
+
+  vector[ngr] alphaG;
+  vector[ngr] betaG;
+  vector<lower=0, upper=1>[ngr] phiG_raw;
+
+  real<lower=0,upper=100> sigmay;
+
+  real<lower=0> sigmaA;
+  real<lower=0> sigmaB;
+  real<lower=0> sigmaP;
+}
+
+transformed parameters {
+  vector[ngr] phiG = minYr + (maxYr-minYr).*phiG_raw;
+}
+
+model{
+      real mu[n];//mu for each observation
+
+      alphaG ~ normal(alpha,sigmaA);
+      betaG ~ normal(beta,sigmaB);
+      phiG ~ normal(phi,sigmaP);
+
+	for (i in 1:n){
+    mu[i]=(alphaG[group[i]]) - (betaG[group[i]]) * int_step(x[i]-(phiG[group[i]]))*(x[i]-(phiG[group[i]]));
+}
+	    y~normal(mu, sigmay);
+
+}
+"
+              ))
+}
+
+
+##editing chain information for model
+rstan_options(auto_write = TRUE)
+options(mc.cores = min(c(parallel::detectCores(), 8)))
+
+nchains <-  min(c(parallel::detectCores(), 8))
+niters <- 100000
+nkeep <- 2500
+nthin <- ceiling((niters/2)*nchains/nkeep)
+
+input.to.stan <- hockey.step(infile=uslilacs, variable="FirstBloom", Year="Year", Group="STID", n.chains=4)
+n.chains <- 4
+n.iter <- 100000
+n.keep <- 2000
+nthin <- max(c(1,floor((n.iter)*n.chains/n.keep)))
+
+comp_model<- stan_model(model_code=input.to.stan$model)
+
+fit2 <- sampling(comp_model, data=input.to.stan$data,
+             init=input.to.stan$inits,
+             pars=input.to.stan$para,
+             iter=niters, chains=input.to.stan$n.chains,
+             thin=nthin)
+
+packages(rstudioapi)
+
+  print(fit2)
+  save ("fit2", file=paste("11.15.19.AllStFit.LU.Rdata", sep=""))
+  
+```
+
+##Calculating Coef. from Bayesian Results
+
+  Below, the Rdata saved from the previous chunk is extracted and used to produce the mean values for each parameter and the 97.5% and 2.5% credible intervals of the hyperparameters and group-level coefficents for all groups/stations in the model. To produce the means and credible intervals of the hyperparameters and group-level coefficients from the Rdata I used the package rv and the function rvsims. This data is then combined with the site specific information to produce a dataset with the values for each hyperparameter with credible intervals, group-level coefficients with hyperparameters, site id, elevation, latitude, longitude, and phenotype for future geographic comparisons.
+
+```{r, message=FALSE}
+
+load("11.15.19.AllStFit.LU.Rdata")
+fit2coefGr<- rstan::extract(fit2, permuted=T)
+
+PhHypRv<-rvsims(fit2coefGr$phi)
+AHypRv<-rvsims(fit2coefGr$alpha)
+BHypRv<-rvsims(fit2coefGr$beta)
+
+PhHyp<-as.data.frame(print(PhHypRv))
+AHyp<-as.data.frame(print(AHypRv))
+BHyp<-as.data.frame(print(BHypRv))
+
+PhGrRv<-rvsims(fit2coefGr$phiG)
+AGrRv<-rvsims(fit2coefGr$alphaG)
+BGrRv<-rvsims(fit2coefGr$betaG)
+
+PhGr<-as.data.frame(print(PhGrRv))
+AGr<-as.data.frame(print(AGrRv))
+BGr<-as.data.frame(print(BGrRv))
+
+ODyear<-data.frame(Group=paste("Group", 1:53, sep=" "))
+
+ODyear$stid<-sites$stid
+##Customize to dataset
+ODyear$lat<-sites$lat
+##Customize to dataset
+ODyear$lon<-sites$lon
+##Customize to dataset
+ODyear$elv<-sites$elv
+##Customize to dataset
+ODyear$Ptype<-StPtype$Ptype
+
+ODyear$PhHyMean<-PhHyp$mean
+ODyear$PhHy2.5<-PhHyp$`2.5%`
+ODyear$PhHy97.5<-PhHyp$`97.5%`
+
+ODyear$AHyMean<-AHyp$mean
+ODyear$AHy2.5<-AHyp$`2.5%`
+ODyear$AHy97.5<-AHyp$`97.5%`
+
+ODyear$BHyMean<-BHyp$mean
+ODyear$BHy2.5<-BHyp$`2.5%`
+ODyear$BHy97.5<-BHyp$`97.5%`
+
+ODyear$PhGrMean<-PhGr$mean
+ODyear$PhGr2.5<-PhGr$`2.5%`
+ODyear$PhGr97.5<-PhGr$`97.5%`
+
+ODyear$AGrMean<-AGr$mean
+ODyear$AGr2.5<-AGr$`2.5%`
+ODyear$AGr97.5<-AGr$`97.5%`
+
+ODyear$BGrMean<-BGr$mean
+ODyear$BGr2.5<-BGr$`2.5%`
+ODyear$BGr97.5<-BGr$`97.5%`
+
+FByearST<-ODyear
+##Customize to dataset
+
+##Ordering things
+as.vector(FByearST$lat)
+##Change thigns to character strings with no vectors
+pV<-as.vector(FByearST$lat)
+pV<-ordered(pV)
+##is now alphabetically ordered
+pV.mu<-tapply(FByearST$PhGrMean, pV, mean)
+##put things in order from least to greatest 
+oo<-order(pV.mu)
+oo
+##in alphabetical
+  levels (pV)
+##puts in order of oo - so means going from least to greatest 
+pV<-ordered(pV, levels=levels(pV)[oo])
+pV
+##from least to greatest
+
+##FOR Beta
+##Change thigns to character strings with no vectors
+bV<-as.vector(FByearST$lat)
+bV<-ordered(bV)
+##is now alphabetically ordered
+bV.mu<-tapply(FByearST$BGrMean, bV, mean)
+##put things in order from least to greatest 
+oo<-order(bV.mu)
+oo
+##in alphabetical
+levels (bV)
+##puts in order of oo - so means going from least to greatest 
+bV<-ordered(bV, levels=levels(bV)[oo])
+bV
+##from least to greatest
+
+FByearST$pV<-pV
+FByearST$bV<-bV
+
+FByearST$stid.lat<- reorder(FByearST$stid, FByearST$lat)
+
+```
+
+##Mapping all 53 Stations
+
+  Below I map the resulting 53 stations with at least 30 years of data onto a map of North America using ggplot. I also include the 2 station worth noting that have the earliest and latest changepoints. 
+
+```{r, message=FALSE}
+#Getting information on 2 key stations noted in manuscript
+stat2.a<-FByearST[FByearST$stid==49122,]
+##A is blue 
+stat2.b<-FByearST[FByearST$stid==213303,]
+##B is purple
+
+#Ensuring the latitude and longitude are in numeric format for mapping
+stat2a.lat<-as.numeric(stat2.a$lat)
+stat2a.long<-as.numeric(stat2.a$lon)
+
+stat2b.lat<-as.numeric(stat2.b$lat)
+stat2b.long<-as.numeric(stat2.b$lon)
+
+#Mapping all stations with at least 30 years of data onto a map of the US and Canada and adding the 2 noted stations
+ggplot(FByearST, aes(lon, lat))+borders(database="world", regions ="USA", xlim=c(-126, -50), ylim=c(28,50))+geom_point(shape=1, size=1.5)+ geom_point(aes(stat2a.long,stat2a.lat), shape=5, size=2, color="blue")+ geom_point(aes(stat2b.long,stat2b.lat), shape=2, size=2, color="purple")+theme(axis.title = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), axis.line = element_blank())
+ggsave(file="LilacSpeciesMap_53StationsSM.eps", device = "eps", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 3.3, height = 2.2)
+dev.off()
+
+```
+
+##Plotting Results for Stations
+
+  In this section I plot the hockey-stick model for each individual station and the overall average model (aka the model represented by the hyperparameters). This model is plotted using the general plot functions in r. I then use ggplot to take a deeper look at the $\phi$ and $\beta$ for each individual station. In these plots they are organized from the highest latitude at the top to the lowest latitude at the bottom of the graph. It is important to note that I cannot directly compare the credible intervals of individual stations to discern a significant difference because of the correlations among the estimated site-specific changepoints (Qian 2012), but I can compare the mean values for each station. 
+
+```{R, message=FALSE}
+#Plotting the hockey-stick graphs based on the determined parameters for all stations and the hyperparameters
+
+#jpeg(file="C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU\\LilacMultilevelwHype.jpg")
+postscript(file="C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU\\LilacMultilevelwHyperSM.eps",horiz=FALSE,onefile=FALSE,width=3.3,height=3.025,paper="letter")
+plot(FirstBloom~Year,type="n", data=uslilacs, col="gray92", ylab="First Bloom Day of Year")
+for (i in 1:53)
+  segments(x0=c(1956, FByearST[i,16]), y0=c(FByearST[i,19], FByearST[i,19]), x1=c(FByearST[i,16],2003), y1=c(FByearST[i,19], FByearST[i,19]-(FByearST[i,22]*(2003-FByearST[i,16]))), col="gray80")
+segments(x0=c(1956, FByearST[1,7]), y0=c(FByearST[1,10], FByearST[1,10]), x1=c(FByearST[1,7],2003), y1=c(FByearST[1,10], FByearST[1,10]-(FByearST[1,13]*(2003-FByearST[1,7]))), col="black", lwd=2)
+dev.off()
+
+#plotting the changepoint and associated credible intervals for all 53 stations based on latitude 
+x<-print(ggplot(data=FByearST, aes(x = stid.lat, y = PhGrMean, ymax = PhGr97.5, ymin = PhGr2.5)) + geom_point(position=position_dodge(width=0.2), color="darkblue") + geom_errorbar(position=position_dodge(width = 0.2), width=0.1, color="darkblue")+coord_flip()+labs(x=("Station"), y=(expression(phi))))
+ggsave(file="LilacMLevelPhiSTwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 4, height = 10)
+dev.off()
+
+#plotting the slope after the changepoint and associated credible intervals for all 53 stations based on latitude
+y<-print(ggplot(data=FByearST, aes(x = stid.lat, y = BGrMean, ymax = BGr97.5, ymin = BGr2.5)) + geom_point(position=position_dodge(width=0.2), color="darkblue") + geom_errorbar(position=position_dodge(width = 0.2), width=0.1, color="darkblue")+coord_flip()+labs(x=("Station"), y=(expression(beta))))
+ggsave(file="LilacMLevelBetaSTwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 4, height = 10)
+dev.off()
+
+#combining the slope after changepoint and changepoint graphs into 1 image
+togST<-ggdraw() +
+    draw_plot(x, x = 0, y = 0.02, width = 0.5, height =0.94)+
+    draw_plot(y, x = 0.5, y = 0.02, width = 0.5, height =0.94) 
+togST
+ggsave(file="LilacMLM_STwHypeSM.eps", device = "eps", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 6.85, height = 8.5625)
+
+```
+
+##Plotting Station Phi and Beta Versus Latitude 
+
+  Here I begin to explore the $\beta$ and $\phi$ for each station to see if there is a geographic correlation to to the values. In this chunk I plot the Values by latitude. 
+
+```{r, message=FALSE}
+#Turning tha latitudes into a vector so they may be organized
+Stat.Lat.Rv<-as.vector(FByearST$lat)
+
+Phi.Gr.Lat.Rv<-cc(PhGrRv, Stat.Lat.Rv)
+
+#Plotting all 53 stations with by latitude with the latitude as the Y axis title for phi
+LatPhi<-print(ggplot(data=FByearST, aes(x =lat, y = PhGrMean, ymax = PhGr97.5, ymin = PhGr2.5)) + geom_point(color="darkblue") + geom_errorbar(width=0.1, color="darkblue")+labs(x=("Latitude"), y=(expression(phi)))) +coord_flip()
+ggsave(file="LilacMLevelPhiLatitudewHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 4, height = 8)
+dev.off()
+
+#Plotting all 53 stations with by latitude with the latitude as the Y axis title for beta
+LatBeta<-print(ggplot(data=FByearST, aes(x =lat, y = BGrMean, ymax = BGr97.5, ymin = BGr2.5)) + geom_point(color="darkblue") + geom_errorbar(width=0.1, color="darkblue")+labs(x=("Latitude"), y=(expression(beta))))+coord_flip()
+ggsave(file="LilacMLevelBetaLatitudewHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 4, height = 8)
+dev.off()
+
+#combining the 2 previous graphs
+togLat<-ggdraw() +
+    draw_plot(LatPhi, x = 0, y = 0.02, width = 0.5, height =0.94)+
+    draw_plot(LatBeta, x = 0.5, y = 0.02, width = 0.5, height =0.94) 
+togLat
+ggsave(file="LilacMLM_LatwHype.eps", device = "eps", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 8, height = 8)
+
+```
+
+##Plotting Station Phi and Beta Versus Elevation
+
+  In this chunk I continue the exploration of geographic trends to $\phi$ and $\beta$ by plotting these values against the station's elevations. 
+  
+```{r, message=FALSE}
+#Plotting phi by elevation 
+ElePhi<-print(ggplot(data=FByearST, aes(x =elv, y = PhGrMean, ymax = PhGr97.5, ymin = PhGr2.5)) + geom_point(color="darkblue") + geom_errorbar(width=0.1, color="darkblue")+labs(x=("Elevation"), y=(expression(phi))))+coord_flip()
+ggsave(file="LilacMLevelPhiElevationwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 4, height = 8)
+dev.off()
+
+#Plotting beta by elevation
+EleBeta<-print(ggplot(data=FByearST, aes(x =elv, y = BGrMean, ymax = BGr97.5, ymin = BGr2.5)) + geom_point( color="darkblue") + geom_errorbar(width=0.1, color="darkblue")+labs(x=("Elevation"), y=(expression(beta))))+coord_flip()
+ggsave(file="LilacMLevelBetaElevationwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 4, height = 8)
+dev.off()
+
+#combining the 2 previous graphs
+togEle<-ggdraw() +
+    draw_plot(ElePhi, x = 0, y = 0.02, width = 0.5, height =0.94)+
+    draw_plot(EleBeta, x = 0.5, y = 0.02, width = 0.5, height =0.94) 
+togEle
+ggsave(file="LilacMLM_ElewHype.eps", device = "eps", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 8, height = 8)
+
+```
+
+##Plotting Station Phi and Beta Versus PType
+
+Below I investigate if there is a correlation trend between the $\phi$ and $\beta$ and phenotype of the lilac located at the station by plotting these values against the station's phenotype. 
+
+```{r, message=FALSE}
+#ensuring phenotype is a factor of 1 or 2 depending on clone type of lilacs
+FByearST$Ptype<-as.numeric(FByearST$Ptype)
+
+#Plotting phi by phenotype/clone type
+PTypePhi<-print(ggplot(data=FByearST, aes(x =jitter(Ptype), y = PhGrMean, ymax = PhGr97.5, ymin = PhGr2.5)) + geom_point(color="darkblue") + geom_errorbar(width=0.05, color="darkblue")+labs(x=("Phenotype"), y=(expression(phi)))+scale_x_continuous(breaks = c(1,2))+coord_flip())
+ggsave(file="LilacMLevelPhiPtypewHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 4, height = 8)
+dev.off()
+
+#Plotting beta by phenotype/clone type
+PTypeBeta<-print(ggplot(data=FByearST, aes(x =jitter(Ptype), y = BGrMean, ymax = BGr97.5, ymin = BGr2.5))+ labs(x=("Phenotype"), y=(expression(beta))) + geom_point( color="darkblue") + geom_errorbar(width=0.05, color="darkblue")+scale_x_continuous(breaks = c(1,2))+coord_flip())
+ggsave(file="LilacMLevelBetaPtypewHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 4, height = 8)
+dev.off()
+
+#combining both graphs into 1 
+togPType<-ggdraw() +
+    draw_plot(PTypePhi, x = 0, y = 0.02, width = 0.5, height =0.94)+
+    draw_plot(PTypeBeta, x = 0.5, y = 0.02, width = 0.5, height =0.94) 
+togPType
+ggsave(file="LilacMLM_PTypewHype.eps", device = "eps", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 8, height = 6)
+
+```
+
+##Plotting Station Phi and Beta by Ecoregion
+
+####Ecoregions were derived in GIS using an Ecoregion Level 1 Shapefile and Latitude and Longitude Data
+
+Here I plot the $\beta$ and $\phi$ against the level 1 ecoregions that each station is located in. The ecoregions were matched to the latitude and longitude with ArcGIS. 
+
+```{r, message=FALSE}
+
+##save the FByearST dataframe as csv to use in gis
+LilacFirstBloom_MLM_53_Results<-as.data.frame(FByearST)
+write.csv(LilacFirstBloom_MLM_53_Results, paste(dataDIR, "LilacFirstBloom_MLM_Results.csv", sep="/"))
+
+##map of the 53 stations
+ggplot(FByearST, aes(lon, lat, color=as.character(Ptype)))+borders(database="world", regions = c("USA","Canada"), xlim=c(-126, -50), ylim=c(28,50))+geom_point(shape=1)+theme(axis.title = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), axis.line = element_blank()) + scale_colour_discrete(name = "Phenotype")
+ggsave(file="LilacSpeciesMap_53Stations.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 6, height = 4)
+dev.off()
+
+#importing the ecoregions by station csv
+EcoregionStation<-read.csv(paste(dataDIR, "EcoregionsStation.csv", sep="/"), header=T)
+
+#matching ecoregion information with results from model
+FByearST$EcoregionNum<-EcoregionStation$NA_L1CODE
+
+FByearST$EcoregionName<-EcoregionStation$NA_L1NAME
+
+FByearST$EcoregionNum.jit<-jitter(FByearST$EcoregionNum)
+
+#plotting phi for each station by ecoregion
+EcoRegPhi<-print(ggplot(data=FByearST, aes(x = EcoregionNum.jit, y = PhGrMean, ymax = PhGr97.5, ymin = PhGr2.5)) + geom_point(aes(color=EcoregionName)) + geom_errorbar(aes(color=EcoregionName), width=0.05)+labs(x=("Ecoregion"), y=(expression(phi)))+scale_x_continuous(breaks = c(1,2))+coord_flip())
+ggsave(file="LilacMLevelPhiEcoRegwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 8, height = 8)
+dev.off()
+
+#editing legend for combination
+EcoRegPhi2<-EcoRegPhi+theme(legend.position = "none")
+
+#plotting phi for each station based on ecoregion as organized by latitude
+EcoRegLatPhi<-print(ggplot(data=FByearST, aes(x =lat, y = PhGrMean, ymax = PhGr97.5, ymin = PhGr2.5)) + geom_point(color="darkblue") + geom_errorbar(width=0.1, color="darkblue")+labs(x="Latitude", y=(expression(phi))) + facet_grid(~EcoregionName) +coord_flip())
+ggsave(file="LilacMLevelPhiEcoRegLatwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 24, height = 8)
+dev.off()
+
+#plotting beta for each station by ecoregion
+EcoRegBeta<-print(ggplot(data=FByearST, aes(x=EcoregionNum.jit, y = BGrMean, ymax = BGr97.5, ymin = BGr2.5, color=EcoregionName))+ labs(x=("Ecoregion"), y=(expression(beta))) +scale_x_continuous(breaks = c(1,2))+coord_flip()+geom_point()+ geom_errorbar(width=0.05))
+ggsave(file="LilacMLevelBetaEcoRegwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 8, height = 8)
+dev.off()
+
+#editing legend for combination
+EcoRegBeta2<-EcoRegBeta + theme(legend.title = element_text(size = 10),
+  legend.text = element_text(size = 6), legend.key.size = unit(0.5, "cm"), legend.key.width = unit(0.5,"cm"))
+
+#plotting beta for each station based on ecoregion as organized by latitude
+EcoRegLatBeta<-print(ggplot(data=FByearST, aes(x =lat, y = BGrMean, ymax = BGr97.5, ymin = BGr2.5)) + geom_point(color="darkblue") + geom_errorbar(width=0.1, color="darkblue")+labs(x="Latitude", y=(expression(beta))) + facet_grid(~EcoregionName) +coord_flip())
+ggsave(file="LilacMLevelBetaEcoRegLatwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 24, height = 8)
+dev.off()
+
+#plotting the graphs of phi and beta based on ecoregion together
+togEcoReg<-ggdraw() +
+    draw_plot(EcoRegPhi2, x = 0, y = 0.02, width = 0.33, height =0.94)+
+    draw_plot(EcoRegBeta2, x = 0.33, y = 0.02, width = 0.67, height =0.94) 
+togEcoReg
+ggsave(file="LilacMLM_EcoRegwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 12, height = 8)
+
+#plotting the graphs of phi and beta based on ecoregion and latitude together
+togEcoRegLat<-ggdraw() +
+    draw_plot(EcoRegLatPhi, x = 0, y = 0, width = 1, height =0.5)+
+    draw_plot(EcoRegLatBeta, x = 0, y = 0.5, width =1, height =0.5) 
+togEcoRegLat
+ggsave(file="LilacMLM_EcoRegLatwHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 24, height = 16)
+
+```
+
+##Plotting Station Phi and Beta by USDA Harshness Zone
+
+####USDA Hardiness Zones were derived in GIS using an USDA Harshness Zone Shapefile and Latitude and Longitude Data
+
+Lastly, the $\phi$ and $\beta$ are compared to the USDA Hardiness Zone based on latitude and longitude. 
+
+```{r, message=FALSE}
+#importation USDA Hardiness Zone Information as retrieved by GIS
+USDAStation<-read.csv(paste(dataDIR, "StationUSDAHarshLocations.csv", sep="/"), header=T)
+
+#Adding USDA Hardiness information to the model results
+FByearST$USDAZone<-USDAStation$ZONE
+FByearST$USDACode<-USDAStation$GRIDCODE
+FByearST$USDACode.jit<-jitter(FByearST$USDACode)
+
+#Graphing the phi for each station by hardiness zone
+ZonePhi<-print(ggplot(data=FByearST, aes(x =USDACode.jit, y = PhGrMean, ymax = PhGr97.5, ymin = PhGr2.5)) + geom_point(aes(color=USDAZone)) + geom_errorbar(aes(color=USDAZone), width=0.05)+labs(x=("USDA Harshness Zone"), y=(expression(phi)))+scale_x_continuous(breaks = c(1,2))+coord_flip())
+ggsave(file="LilacMLevelPhiUSDAZonewHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 8, height = 8)
+dev.off()
+
+#editing legend for combination
+ZonePhi2<-ZonePhi+theme(legend.position = "none")
+
+#Graphing the beta for each station by hardiness zone
+ZoneBeta<-print(ggplot(data=FByearST, aes(x =USDACode.jit, y = BGrMean, ymax = BGr97.5, ymin = BGr2.5))+ labs(x=("USDA Harshness Zone"), y=(expression(beta))) + geom_point(aes(color=USDAZone)) + geom_errorbar(aes(color=USDAZone), width=0.05)+scale_x_continuous(breaks = c(1,2))+coord_flip())
+ggsave(file="LilacMLevelBetaUSDAZonewHype.jpg", device = "jpg", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 8, height = 8)
+dev.off()
+
+#editing legend for combination
+ZoneBeta2<-ZoneBeta + theme(legend.title = element_text(size = 10),
+  legend.text = element_text(size = 6), legend.key.size = unit(0.65, "cm"), legend.key.width = unit(0.75,"cm")) 
+
+#combining the beta and phi graphs as prganized by hardiness zones
+togZone<-ggdraw() +
+    draw_plot(ZonePhi2, x = 0, y = 0.02, width = 0.43, height =0.94)+
+    draw_plot(ZoneBeta2, x = 0.43, y = 0.02, width = 0.57, height =0.94) 
+togZone
+ggsave(file="LilacMLM_ZonewHype.eps", device = "eps", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 12, height = 8)
+
+```
+
+###Plot Zones, Ecoregions, Latitude, Elevation Together
+
+The section below brings the 4 geographic characteristics associated with station location graphed previously into 1 graph for the online supplemental material. 
+
+```{r, message=False}
+#Graphing all 4 graphs of phi and beta for each different characteristic together into 1 graph
+togAll4<-ggdraw() +
+    draw_plot(togLat, x = 0, y = 0.55, width = 0.475, height =0.423)+
+    draw_plot(togEle, x = 0.52, y = 0.55, width = 0.475, height =0.423) +
+    draw_plot(togEcoReg, x = 0, y = 0.02, width = 0.475, height =0.523)+
+    draw_plot(togZone, x = 0.52, y = 0.02, width = 0.475, height =0.523) 
+
+togAll4
+
+#Saving graph
+ggsave(file="LilacMLM_All4Geo.eps", device = "eps", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures\\Lilac.Manuscript.Updated.Beta.Phi.LU",  width = 16, height = 12)
+
+
+```
+
+##General Hockey-Stick Model Graph
+
+The code below first creates a generic dataset with 3 value to use as endpoints to create a basic graph depicting the shape of the hockey-stick model. Then the dataframe was input into a ggplot graph with the dataframe used as endpoints for the 2 line segments making up a hockey-stick model. 
+
+```{r, message=FALSE}
+#Creating a temporary data frame to show a general hockeystick model graph
+genDF<-data.frame(Y.int=c(1,1,0.005), x=c(0.005, 1, 2))
+
+#Graphing the general hockeystick model graph with labels
+genModel<-print(ggplot(data=genDF, aes(x, Y.int)) + geom_line(size=1) + scale_x_continuous(name="Year", labels=NULL, limits =c(0,2)) + scale_y_continuous(name="Response", labels=NULL, limits =c(0,1.5))+theme(axis.ticks = element_blank()) + annotate( "text", x=0.002, y=1.1, label=expression(alpha), color="blue", size=4)+ annotate( "text", x=1.04, y=1.07, label=expression(phi), color="dark green", size=4) + annotate( "text", x=1.65, y=0.5, label=expression(beta), color="purple", size=4))
+ggsave(file="GeneralHockeyStickModelGraph.eps", device = "eps", path = "C:\\Users\\steph\\Documents\\UToledo_PHD\\PhD Research\\HockeyStick Model\\RMds\\Figures",  width = 3.3, height = 2.0625)
+
+```
+
+
